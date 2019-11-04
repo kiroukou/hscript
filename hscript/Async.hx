@@ -22,9 +22,16 @@
 package hscript;
 import hscript.Expr;
 
+
+enum VarMode {
+	Defined;
+	ForceSync;
+}
+
 class Async {
 
-	var varNames : Array<String>;
+	var definedVars : Array<{ n : String, prev : Null<VarMode> }>;
+	var vars : Map<String,VarMode>;
 	var currentFun : String;
 	var currentLoop : Expr;
 	var currentBreak : Expr -> Expr;
@@ -68,35 +75,53 @@ class Async {
 		return a.build(e, topLevelSync);
 	}
 
+	public dynamic function getTopLevelEnd() {
+		return ignore();
+	}
+
 	public function build( e : Expr, topLevelSync = false ) {
 		if( topLevelSync ) {
 			return buildSync(e,null);
 		} else {
-			var nothing = ignore();
-			return new Async().toCps(e, nothing, nothing);
+			var end = getTopLevelEnd();
+			return toCps(e, end, end);
 		}
+	}
+
+	function defineVar( v : String, mode ) {
+		definedVars.push({ n : v, prev : vars.get(v) });
+		vars.set(v, mode);
+	}
+
+	function lookupFunctions( el : Array<Expr> ) {
+		for( e in el )
+			switch( expr(e) ) {
+			case EFunction(_, _, name, _) if( name != null ): defineVar(name, Defined);
+			case EMeta("sync",_,expr(_) => EFunction(_,_,name,_)) if( name != null ): defineVar(name, ForceSync);
+			default:
+			}
 	}
 
 	function buildSync( e : Expr, exit : Expr ) : Expr {
 		switch( expr(e) ) {
-		case EFunction(_):
-			return toCps(e, null, null);
+		case EFunction(_,_,name,_):
+			if( name != null )
+				return toCps(e, null, null);
+			return e;
 		case EBlock(el):
 			var v = saveVars();
-			for( e in el )
-				switch( expr(e) ) {
-				case EFunction(_, _, name, _) if( name != null ): varNames.push(name);
-				default:
-				}
+			lookupFunctions(el);
 			var e = block([for(e in el) buildSync(e,exit)], e);
 			restoreVars(v);
 			return e;
 		case EMeta("async", _, e):
 			return toCps(e, ignore(), ignore());
+		case EMeta("sync", args, ef = expr(_) => EFunction(fargs, body, name, ret)):
+			return mk(EMeta("sync",args,mk(EFunction(fargs, buildSync(body,null), name, ret),ef)),e);
 		case EBreak if( currentBreak != null ):
 			return currentBreak(e);
 		case EContinue if( currentLoop != null ):
-			return block([call(currentLoop, [nullId], e), mk(EReturn(),e)],e);
+			return block([retNull(currentLoop, e), mk(EReturn(),e)],e);
 		case EFor(_), EWhile(_):
 			var oldLoop = currentLoop, oldBreak = currentBreak;
 			currentLoop = null;
@@ -106,14 +131,15 @@ class Async {
 			currentBreak = oldBreak;
 			return e;
 		case EReturn(eret) if( exit != null ):
-			return block([call(exit,[eret == null ? nullId : eret], e), mk(EReturn(),e)], e);
+			return block([eret == null ? retNull(exit, e) : call(exit,[eret], e), mk(EReturn(),e)], e);
 		default:
 			return Tools.map(e, buildSync.bind(_, exit));
 		}
 	}
 
 	public function new() {
-		varNames = [];
+		vars = new Map();
+		definedVars = [];
 	}
 
 	function ignore(?e) : Expr {
@@ -133,7 +159,9 @@ class Async {
 		return mk(EFunction([for( a in arg ) { name : a, t : null }], e, name), e);
 	}
 
-	inline function block(arr, e) {
+	inline function block(arr:Array<Expr>, e) {
+		if( arr.length == 1 && expr(arr[0]).match(EBlock(_)) )
+			return arr[0];
 		return mk(EBlock(arr), e);
 	}
 
@@ -149,8 +177,12 @@ class Async {
 		return mk(ECall(e, args), inf);
 	}
 
-	function retNull(e) : Expr {
-		return call(e, [nullId],e);
+	function retNull(e:Expr,?pos) : Expr {
+		switch( expr(e) ) {
+		case EFunction([{name:"_"}], e, _, _): return e;
+		default:
+		}
+		return call(e, [nullId], pos == null ? e : pos);
 	}
 
 	function makeCall( ecall, args : Array<Expr>, rest : Expr, exit, sync = false ) {
@@ -179,7 +211,9 @@ class Async {
 		if( !syncFlag )
 			return;
 		switch( expr(e) ) {
-		case ECall(_), EFunction(_):
+		case ECall(_):
+			syncFlag = false;
+		case EFunction(_,_,name,_) if( name != null ):
 			syncFlag = false;
 		case EMeta("sync" | "async", _, _):
 			// isolated from the sync part
@@ -189,11 +223,14 @@ class Async {
 	}
 
 	function saveVars() {
-		return varNames.length;
+		return definedVars.length;
 	}
 
 	function restoreVars(k) {
-		while( varNames.length > k ) varNames.pop();
+		while( definedVars.length > k ) {
+			var v = definedVars.pop();
+			if( v.prev == null ) vars.remove(v.n) else vars.set(v.n, v.prev);
+		}
 	}
 
 	public function toCps( e : Expr, rest : Expr, exit : Expr ) : Expr {
@@ -203,12 +240,7 @@ class Async {
 		case EBlock(el):
 			var el = el.copy();
 			var vold = saveVars();
-			// local recursion
-			for( e in el )
-				switch( expr(e) ) {
-				case EFunction(_, _, name, null): varNames.push(name);
-				default:
-				}
+			lookupFunctions(el);
 			while( el.length > 0 ) {
 				var e = toCps(el.pop(), rest, exit);
 				rest = ignore(e);
@@ -218,9 +250,9 @@ class Async {
 		case EFunction(args, body, name, t):
 			var vold = saveVars();
 			if( name != null )
-				varNames.push(name);
+				defineVar(name, Defined);
 			for( a in args )
-				varNames.push(a.name);
+				defineVar(a.name, Defined);
 			args.unshift( { name : "_onEnd", t : null } );
 			var frest = ident("_onEnd",e);
 			var oldFun = currentFun;
@@ -241,7 +273,8 @@ class Async {
 			var args = [for( a in args ) fun("_rest", toCps(block([a],a), ident("_rest",a), exit))];
 			return call(ident("split",e), [rest, mk(EArrayDecl(args),e)],e);
 		case ECall(expr(_) => EIdent(i), args):
-			return makeCall( ident( varNames.indexOf(i) < 0 ? "a_" + i : i,e) , args, rest, exit);
+			var mode = vars.get(i);
+			return makeCall( ident( mode != null ? i : "a_" + i,e) , args, rest, exit, mode == ForceSync);
 		case ECall(expr(_) => EField(e, f), args):
 			return makeCall(field(e,"a_"+f,e), args, rest, exit);
 		case EFor(v, eit, eloop):
@@ -250,7 +283,7 @@ class Async {
 			var oldLoop = currentLoop, oldBreak = currentBreak;
 			var loop = ident("_loop" + id,e);
 			currentLoop = loop;
-			currentBreak = function(inf) return block([call(rest, [nullId], inf), mk(EReturn(),inf)], inf);
+			currentBreak = function(inf) return block([retNull(rest, inf), mk(EReturn(),inf)], inf);
 			var efor = block([
 				mk(EVar("_i" + id, call(ident("makeIterator",eit),[eit],eit)),eit),
 				fun("_", block([
@@ -258,7 +291,7 @@ class Async {
 					mk(EVar(v, call(field(it, "next",it), [], it)), it),
 					toCps(eloop, loop, exit),
 				], it),"_loop" + id),
-				call(loop, [nullId], e),
+				retNull(loop, e),
 			], e);
 			currentLoop = oldLoop;
 			currentBreak = oldBreak;
@@ -306,18 +339,18 @@ class Async {
 			var loop = ident("_loop" + id, cond);
 			var oldLoop = currentLoop, oldBreak = currentBreak;
 			currentLoop = loop;
-			currentBreak = function(e) return block([call(rest, [nullId], e), mk(EReturn(),e)],e);
+			currentBreak = function(e) return block([retNull(rest,e), mk(EReturn(),e)],e);
 			var ewhile = block([
 				fun("_r",
-					toCps(cond, fun("_c", mk(EIf(ident("_c", cond), toCps(ewh, loop, exit), call(rest, [nullId], cond)),cond)), exit)
+					toCps(cond, fun("_c", mk(EIf(ident("_c", cond), toCps(ewh, loop, exit), retNull(rest,cond)),cond)), exit)
 				, "_loop"+id),
-				call(loop, [nullId], cond),
+				retNull(loop, cond),
 			],e);
 			currentLoop = oldLoop;
 			currentBreak = oldBreak;
 			return ewhile;
 		case EReturn(eret):
-			return eret == null ? call(exit, [nullId], e) : toCps(eret, exit, exit);
+			return eret == null ? retNull(exit, e) : toCps(eret, exit, exit);
 		case EObject(fields):
 			var id = "_o" + uid++;
 			var rest = call(rest, [ident(id,e)], e);
@@ -353,10 +386,10 @@ class Async {
 			return toCps(earr, fun(id1, toCps(eindex, fun(id2, call(rest, [mk(EArray(ident(id1,e), ident(id2,e)),e)], e)), exit)), exit);
 		case EVar(v, t, ev):
 			if( ev == null )
-				return block([e, call(rest, [nullId],e)], e);
+				return block([e, retNull(rest, e)], e);
 			return block([
 				mk(EVar(v, t),e),
-				toCps(ev, fun("_r", block([binop("=", ident(v,e), ident("_r",e), e), call(rest,[nullId],e)], e)), exit),
+				toCps(ev, fun("_r", block([binop("=", ident(v,e), ident("_r",e), e), retNull(rest,e)], e)), exit),
 			],e);
 		case EConst(_), EIdent(_), EUnop(_), EField(_):
 			return call(rest, [e], e);
@@ -375,7 +408,7 @@ class Async {
 			return currentBreak(e);
 		case EContinue:
 			if( currentLoop == null ) throw "Continue outside loop";
-			return block([call(currentLoop, [nullId], e), mk(EReturn(),e)], e);
+			return block([retNull(currentLoop, e), mk(EReturn(),e)], e);
 		case ESwitch(v, cases, def):
 			var cases = [for( c in cases ) { values : c.values, expr : toCps(c.expr, rest, exit) } ];
 			return toCps(v, mk(EFunction([ { name : "_c", t : null } ], mk(ESwitch(ident("_c",v), cases, def == null ? retNull(rest) : toCps(def, rest, exit)),e)),e), exit );

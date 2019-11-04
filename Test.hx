@@ -4,10 +4,11 @@ import hscript.Macro;
 import hscript.Tools;
 import hscript.Async;
 import hscript.Printer;
+import hscript.Checker;
 import haxe.unit.*;
 
 class Test extends TestCase {
-	function assertScript(x,v:Dynamic,?vars : Dynamic,allowTypes=false) {
+	function assertScript(x,v:Dynamic,?vars : Dynamic, allowTypes=false, ?pos:haxe.PosInfos) {
 		var p = new hscript.Parser();
 		p.allowTypes = allowTypes;
 		var program = p.parseString(x);
@@ -18,7 +19,7 @@ class Test extends TestCase {
 			for( v in Reflect.fields(vars) )
 				interp.variables.set(v,Reflect.field(vars,v));
 		var ret : Dynamic = interp.execute(program);
-		assertEquals(v, ret);
+		assertEquals(v, ret, pos);
 	}
 
 	function test():Void {
@@ -99,6 +100,16 @@ class Test extends TestCase {
 		assertScript("var a:Array<Dynamic>=[1,2,4]; a[2]", 4, null, true);
 		assertScript("/**/0", 0);
 		assertScript("x=1;x*=-2", -2);
+		assertScript("var f = x -> x + 1; f(3)", 4);
+		assertScript("var f = (x) -> x + 1; f(3)", 4);
+		assertScript("var f = (x:Int) -> x + 1; f(3)", 4);
+		assertScript("var f = (x,y) -> x + y; f(3,1)", 4);
+		assertScript("var f = (x,y:Int) -> x + y; f(3,1)", 4);
+		assertScript("var f = (x:Int,y:Int) -> x + y; f(3,1)", 4);
+		assertScript("var f:Int->Int->Int = (x:Int,y:Int) -> x + y; f(3,1)", 4, null, true);
+		assertScript("var f:(x:Int, y:Int)->Int = (x:Int,y:Int) -> x + y; f(3,1)", 4, null, true);
+		assertScript("var f:(x:Int)->(y:Int, z:Int)->Int = (x:Int) -> (y:Int, z:Int) -> x + y + z; f(3)(1, 2)", 6, null, true);
+		assertScript("var f:(x:Int)->(Int, Int)->Int = (x:Int) -> (y:Int, z:Int) -> x + y + z; f(3)(1, 2)", 6, null, true);
 	}
 
 	function testMap():Void {
@@ -152,9 +163,16 @@ class Test extends TestCase {
 	}
 
 	static function main() {
+		#if ((haxe_ver < 4) && php)
+		// uncaught exception: The each() function is deprecated. This message will be suppressed on further calls (errno: 8192)
+		// in file: /Users/travis/build/andyli/hscript/bin/lib/Type.class.php line 178
+		untyped __php__("error_reporting(E_ALL ^ E_DEPRECATED);");
+		#end
+
 		var runner = new TestRunner();
 		runner.add(new Test());
 		var succeed = runner.run();
+
 		#if sys
 			Sys.exit(succeed ? 0 : 1);
 		#elseif flash
